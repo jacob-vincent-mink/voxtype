@@ -472,6 +472,70 @@ The NPU driver requires a reboot; verify it with `ls /dev/accel/accel*`. For an
 Intel GPU, verify a render node with `ls /dev/dri/renderD*`. Set `device = "CPU"`
 for CPU-only inference, which needs no device-specific driver.
 
+### This fork: `feature/streaming-on-npu`
+
+This branch (on top of upstream's OpenVINO/NPU work) adds streaming
+transcription support for the OpenVINO backend plus several NPU-specific
+fixes. To set it up:
+
+```bash
+git clone https://github.com/tslove923/voxtype.git
+cd voxtype
+git checkout feature/streaming-on-npu
+
+cargo build --release --features openvino-whisper
+
+# Same package/driver install as above, plus the C API SDK (see above) --
+# this branch adds no new system dependencies.
+
+voxtype setup model  # pick an OpenVINO model; the downloader on this
+                      # branch fetches preprocessor_config.json alongside
+                      # the .xml/.bin graph files (see "Fixes" below)
+
+cat >> ~/.config/voxtype/config.toml << 'EOF'
+engine = "openvino"
+
+[openvino]
+model = "medium-int4"   # or any downloaded OpenVINO model
+device = "NPU"          # falls back to GPU, then CPU, if NPU init fails
+
+[streaming]
+enabled = true
+revision_mode = true    # re-transcribes the sliding window as more audio
+                         # arrives instead of only finalizing on stop
+EOF
+```
+
+**What this branch changes vs. plain upstream OpenVINO/NPU:**
+
+- **Streaming on OpenVINO** -- `[streaming]` works with `engine = "openvino"`,
+  not just the whisper.cpp engine. `revision_mode = true` is recommended;
+  without it, streaming still works but doesn't correct earlier words as
+  later audio disambiguates them.
+- **`preprocessor_config.json` fix** -- upstream's OpenVINO model downloader
+  omits this file. Its absence doesn't fail model load; it fails the first
+  real transcription with an opaque "unknown exception" *after* the daemon
+  has already logged ready. If you have an existing OpenVINO model
+  directory downloaded before this fix, re-run `voxtype setup model` (or see
+  Troubleshooting below) to backfill the file for that model.
+- **Device fallback chain** -- `device = "NPU"` now tries NPU, then falls
+  back to GPU, then CPU, logging why at each step, instead of failing
+  outright if NPU init doesn't succeed.
+- **Long first-compile warning** -- **NPU compilation of large models is
+  slow, not broken.** A `large-v3-int4` model's first NPU compile can take
+  up to ~15 minutes with *no log output* in between at default log levels
+  -- this is expected NPU kernel-compilation time, not a hang. Subsequent
+  loads are fast once compiled. Run with `-vv` if you want visibility into
+  what OpenVINO is doing during that window. `medium-int4` and smaller
+  compile in well under a minute.
+
+Compiled-kernel caching (`CACHE_DIR`, so the long first compile only
+happens once) needs `WhisperPipeline::with_properties`, which is present in
+this branch's `openvino-genai` dependency version. If you're pinned to an
+older `openvino-genai` without that API, the long NPU compile repeats on
+every daemon start rather than being cached -- upgrade `openvino-genai` to
+get one-time compilation.
+
 ### Performance Comparison
 
 Results vary by hardware. Example on AMD RX 6800:
