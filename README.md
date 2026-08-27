@@ -1,5 +1,12 @@
 # Voxtype
 
+> **This is a fork.** The `feature/streaming-on-npu` branch adds streaming
+> transcription support to the OpenVINO/Intel NPU backend, plus fixes for a
+> missing-model-file bug and a device fallback chain (NPU → GPU → CPU). See
+> [Setup: `feature/streaming-on-npu`](#this-fork-featurestreaming-on-npu)
+> for what's different and how to get it running. Everything below this
+> notice is upstream's own README.
+
 [![Voxtype - Voice to Text for Linux](website/images/og-preview.png)](https://voxtype.io)
 
 **[voxtype.io](https://voxtype.io)**
