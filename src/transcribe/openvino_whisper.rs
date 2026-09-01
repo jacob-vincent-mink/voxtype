@@ -10,10 +10,377 @@
 use super::Transcriber;
 use crate::config::OpenVinoConfig;
 use crate::error::TranscribeError;
-use openvino_genai::WhisperPipeline;
+use libloading::Library;
+use std::ffi::{c_char, c_void, CString};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
+
+// OpenVINO GenAI's public C API is the stable boundary we need. Keeping these
+// few declarations here avoids pulling the LLM/VLM/tokenizer surface (and the
+// generated openvino-rs bindings) into Voxtype.
+type Status = i32;
+type Handle = c_void;
+
+type PipelineCreate = unsafe extern "C" fn(
+    *const c_char,
+    *const c_char,
+    usize,
+    *mut *mut Handle,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+) -> Status;
+type PipelineFree = unsafe extern "C" fn(*mut Handle);
+type PipelineGenerate =
+    unsafe extern "C" fn(*mut Handle, *const f32, usize, *const Handle, *mut *mut Handle) -> Status;
+type PipelineGetConfig = unsafe extern "C" fn(*const Handle, *mut *mut Handle) -> Status;
+type ConfigFree = unsafe extern "C" fn(*mut Handle);
+type ConfigGetBool = unsafe extern "C" fn(*const Handle, *mut bool) -> Status;
+type ConfigSetString = unsafe extern "C" fn(*mut Handle, *const c_char) -> Status;
+type ConfigSetBool = unsafe extern "C" fn(*mut Handle, bool) -> Status;
+type ResultsFree = unsafe extern "C" fn(*mut Handle);
+type ResultsGetString = unsafe extern "C" fn(*const Handle, *mut c_char, *mut usize) -> Status;
+
+#[derive(Debug)]
+struct GenAiApi {
+    // Function pointers below are valid only while this library remains open.
+    _library: Library,
+    pipeline_create: PipelineCreate,
+    pipeline_free: PipelineFree,
+    pipeline_generate: PipelineGenerate,
+    pipeline_get_config: PipelineGetConfig,
+    config_free: ConfigFree,
+    config_get_is_multilingual: ConfigGetBool,
+    config_set_language: ConfigSetString,
+    config_set_task: ConfigSetString,
+    config_set_return_timestamps: ConfigSetBool,
+    results_free: ResultsFree,
+    results_get_string: ResultsGetString,
+}
+
+impl GenAiApi {
+    unsafe fn symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T, TranscribeError> {
+        library
+            .get::<T>(name)
+            .map(|symbol| *symbol)
+            .map_err(|error| {
+                TranscribeError::InitFailed(format!(
+                    "OpenVINO GenAI library is missing symbol {}: {}",
+                    String::from_utf8_lossy(name).trim_end_matches('\0'),
+                    error
+                ))
+            })
+    }
+
+    unsafe fn open(path: &std::path::Path) -> Result<Arc<Self>, TranscribeError> {
+        let library = Library::new(path).map_err(|error| {
+            TranscribeError::InitFailed(format!(
+                "Failed to load OpenVINO GenAI library from {}: {}",
+                path.display(),
+                error
+            ))
+        })?;
+
+        macro_rules! sym {
+            ($name:literal) => {
+                Self::symbol(&library, concat!($name, "\0").as_bytes())?
+            };
+        }
+
+        Ok(Arc::new(Self {
+            pipeline_create: sym!("ov_genai_whisper_pipeline_create"),
+            pipeline_free: sym!("ov_genai_whisper_pipeline_free"),
+            pipeline_generate: sym!("ov_genai_whisper_pipeline_generate"),
+            pipeline_get_config: sym!("ov_genai_whisper_pipeline_get_generation_config"),
+            config_free: sym!("ov_genai_whisper_generation_config_free"),
+            config_get_is_multilingual: sym!(
+                "ov_genai_whisper_generation_config_get_is_multilingual"
+            ),
+            config_set_language: sym!("ov_genai_whisper_generation_config_set_language"),
+            config_set_task: sym!("ov_genai_whisper_generation_config_set_task"),
+            config_set_return_timestamps: sym!(
+                "ov_genai_whisper_generation_config_set_return_timestamps"
+            ),
+            results_free: sym!("ov_genai_whisper_decoded_results_free"),
+            results_get_string: sym!("ov_genai_whisper_decoded_results_get_string"),
+            _library: library,
+        }))
+    }
+}
+
+fn c_string(value: &str, what: &str) -> Result<CString, TranscribeError> {
+    CString::new(value).map_err(|_| {
+        TranscribeError::ConfigError(format!("{} contains an embedded NUL byte", what))
+    })
+}
+
+fn status_name(status: Status) -> &'static str {
+    match status {
+        -1 => "general error",
+        -2 => "not implemented",
+        -3 => "network not loaded",
+        -4 => "parameter mismatch",
+        -5 => "not found",
+        -6 => "out of bounds",
+        -7 => "unexpected error",
+        -8 => "request busy",
+        -9 => "result not ready",
+        -10 => "not allocated",
+        -11 => "inference not started",
+        -12 => "network not read",
+        -13 => "inference cancelled",
+        -14 => "invalid C parameter",
+        -15 => "unknown C error",
+        -16 => "C method not implemented",
+        -17 => "unknown exception",
+        _ => "unknown status",
+    }
+}
+
+fn check(status: Status, operation: &str) -> Result<(), TranscribeError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(TranscribeError::InferenceFailed(format!(
+            "{}: {} ({})",
+            operation,
+            status_name(status),
+            status
+        )))
+    }
+}
+
+struct WhisperPipeline {
+    ptr: NonNull<Handle>,
+    api: Arc<GenAiApi>,
+}
+
+// OpenVINO serializes use through OpenVinoTranscriber's Mutex. The native
+// pipeline can therefore move between worker threads but is never used twice.
+unsafe impl Send for WhisperPipeline {}
+
+impl WhisperPipeline {
+    fn with_properties(
+        api: Arc<GenAiApi>,
+        models_path: &str,
+        device: &str,
+        properties: &[(&str, &str)],
+    ) -> Result<Self, TranscribeError> {
+        const MAX_PROPERTIES: usize = 8;
+        if properties.len() > MAX_PROPERTIES {
+            return Err(TranscribeError::ConfigError(format!(
+                "OpenVINO accepts at most {} device properties",
+                MAX_PROPERTIES
+            )));
+        }
+
+        let models_path = c_string(models_path, "model path")?;
+        let device = c_string(device, "device")?;
+        let property_strings = properties
+            .iter()
+            .flat_map(|(key, value)| [(*key, "property key"), (*value, "property value")])
+            .map(|(value, what)| c_string(value, what))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut property_ptrs = [std::ptr::null(); MAX_PROPERTIES * 2];
+        for (slot, value) in property_ptrs.iter_mut().zip(&property_strings) {
+            *slot = value.as_ptr();
+        }
+
+        let mut ptr = std::ptr::null_mut();
+        let status = unsafe {
+            (api.pipeline_create)(
+                models_path.as_ptr(),
+                device.as_ptr(),
+                property_strings.len(),
+                &mut ptr,
+                property_ptrs[0],
+                property_ptrs[1],
+                property_ptrs[2],
+                property_ptrs[3],
+                property_ptrs[4],
+                property_ptrs[5],
+                property_ptrs[6],
+                property_ptrs[7],
+                property_ptrs[8],
+                property_ptrs[9],
+                property_ptrs[10],
+                property_ptrs[11],
+                property_ptrs[12],
+                property_ptrs[13],
+                property_ptrs[14],
+                property_ptrs[15],
+            )
+        };
+        check(status, "creating Whisper pipeline")?;
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            TranscribeError::InitFailed(
+                "OpenVINO returned success but no Whisper pipeline".to_string(),
+            )
+        })?;
+        Ok(Self { ptr, api })
+    }
+
+    fn generation_config(&self) -> Result<WhisperGenerationConfig, TranscribeError> {
+        let mut ptr = std::ptr::null_mut();
+        check(
+            unsafe { (self.api.pipeline_get_config)(self.ptr.as_ptr(), &mut ptr) },
+            "getting Whisper generation config",
+        )?;
+        Ok(WhisperGenerationConfig {
+            ptr: NonNull::new(ptr).ok_or_else(|| {
+                TranscribeError::InferenceFailed(
+                    "OpenVINO returned no Whisper generation config".to_string(),
+                )
+            })?,
+            api: Arc::clone(&self.api),
+        })
+    }
+
+    fn generate(
+        &mut self,
+        audio: &[f32],
+        config: &WhisperGenerationConfig,
+    ) -> Result<WhisperResults, TranscribeError> {
+        let mut ptr = std::ptr::null_mut();
+        check(
+            unsafe {
+                (self.api.pipeline_generate)(
+                    self.ptr.as_ptr(),
+                    audio.as_ptr(),
+                    audio.len(),
+                    config.ptr.as_ptr(),
+                    &mut ptr,
+                )
+            },
+            "running OpenVINO GenAI inference",
+        )?;
+        Ok(WhisperResults {
+            ptr: NonNull::new(ptr).ok_or_else(|| {
+                TranscribeError::InferenceFailed(
+                    "OpenVINO returned success but no transcription result".to_string(),
+                )
+            })?,
+            api: Arc::clone(&self.api),
+        })
+    }
+}
+
+impl Drop for WhisperPipeline {
+    fn drop(&mut self) {
+        unsafe { (self.api.pipeline_free)(self.ptr.as_ptr()) };
+    }
+}
+
+struct WhisperGenerationConfig {
+    ptr: NonNull<Handle>,
+    api: Arc<GenAiApi>,
+}
+
+impl WhisperGenerationConfig {
+    fn is_multilingual(&self) -> Result<bool, TranscribeError> {
+        let mut value = false;
+        check(
+            unsafe { (self.api.config_get_is_multilingual)(self.ptr.as_ptr(), &mut value) },
+            "reading Whisper multilingual flag",
+        )?;
+        Ok(value)
+    }
+
+    fn set_string(
+        &mut self,
+        setter: ConfigSetString,
+        value: &str,
+        operation: &str,
+    ) -> Result<(), TranscribeError> {
+        let value = c_string(value, operation)?;
+        check(
+            unsafe { setter(self.ptr.as_ptr(), value.as_ptr()) },
+            operation,
+        )
+    }
+
+    fn set_language(&mut self, value: &str) -> Result<(), TranscribeError> {
+        self.set_string(
+            self.api.config_set_language,
+            value,
+            "setting Whisper language",
+        )
+    }
+
+    fn set_task(&mut self, value: &str) -> Result<(), TranscribeError> {
+        self.set_string(self.api.config_set_task, value, "setting Whisper task")
+    }
+
+    fn set_return_timestamps(&mut self, value: bool) -> Result<(), TranscribeError> {
+        check(
+            unsafe { (self.api.config_set_return_timestamps)(self.ptr.as_ptr(), value) },
+            "setting Whisper timestamp mode",
+        )
+    }
+}
+
+impl Drop for WhisperGenerationConfig {
+    fn drop(&mut self) {
+        unsafe { (self.api.config_free)(self.ptr.as_ptr()) };
+    }
+}
+
+struct WhisperResults {
+    ptr: NonNull<Handle>,
+    api: Arc<GenAiApi>,
+}
+
+impl WhisperResults {
+    fn text(&self) -> Result<String, TranscribeError> {
+        let mut size = 0;
+        check(
+            unsafe {
+                (self.api.results_get_string)(self.ptr.as_ptr(), std::ptr::null_mut(), &mut size)
+            },
+            "reading Whisper result size",
+        )?;
+        if size == 0 {
+            return Ok(String::new());
+        }
+
+        let mut buffer = vec![0_u8; size];
+        check(
+            unsafe {
+                (self.api.results_get_string)(
+                    self.ptr.as_ptr(),
+                    buffer.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            },
+            "reading Whisper result",
+        )?;
+        if buffer.last() == Some(&0) {
+            buffer.pop();
+        }
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
+    }
+}
+
+impl Drop for WhisperResults {
+    fn drop(&mut self) {
+        unsafe { (self.api.results_free)(self.ptr.as_ptr()) };
+    }
+}
 
 /// Directory OpenVINO persists compiled device blobs to (`CACHE_DIR`
 /// property), so NPU/GPU graph compilation isn't repeated on every pipeline
@@ -122,7 +489,7 @@ impl OpenVinoTranscriber {
     }
 
     /// Load the OpenVINO GenAI shared library, using a custom path if configured.
-    fn load_library(config: &OpenVinoConfig) -> Result<(), TranscribeError> {
+    fn load_library(config: &OpenVinoConfig) -> Result<Arc<GenAiApi>, TranscribeError> {
         if let Some(ref dir) = config.openvino_dir {
             let lib_path = find_genai_library(dir).map_err(|error| {
                 TranscribeError::InitFailed(format!(
@@ -142,7 +509,7 @@ impl OpenVinoTranscriber {
                 "Loading OpenVINO GenAI library from: {}",
                 lib_path.display()
             );
-            openvino_genai::load_from(&lib_path).map_err(|e| {
+            unsafe { GenAiApi::open(&lib_path) }.map_err(|e| {
                 TranscribeError::InitFailed(format!(
                     "Failed to load OpenVINO GenAI library from {}: {}\n  \
                      Ensure libopenvino_genai_c.so exists in the specified openvino_dir.\n\n{}",
@@ -151,12 +518,28 @@ impl OpenVinoTranscriber {
                     config.installation_guidance(),
                 ))
             })
+        } else if let Some(path) = std::env::var_os("OPENVINO_GENAI_LIB_PATH") {
+            unsafe { GenAiApi::open(std::path::Path::new(&path)) }
+        } else if let Some(root) = std::env::var_os("OPENVINO_INSTALL_DIR") {
+            let root = root.to_string_lossy();
+            let lib_path = find_genai_library(&root)?;
+            if let Some(lib_dir) = lib_path.parent() {
+                preload_openvino_deps(lib_dir);
+            }
+            unsafe { GenAiApi::open(&lib_path) }
         } else {
-            openvino_genai::load().map_err(|e| {
+            let lib_name = format!(
+                "{}openvino_genai_c{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            );
+            unsafe { GenAiApi::open(std::path::Path::new(&lib_name)) }.map_err(|e| {
                 TranscribeError::InitFailed(format!(
                     "Failed to load OpenVINO GenAI library: {}\n  \
-                     Automatic discovery did not find libopenvino_genai_c.so.\n\n{}",
+                     The platform loader did not find {}. Set openvino_dir, \
+                     OPENVINO_GENAI_LIB_PATH, or OPENVINO_INSTALL_DIR.\n\n{}",
                     e,
+                    lib_name,
                     config.installation_guidance(),
                 ))
             })
@@ -170,7 +553,7 @@ impl OpenVinoTranscriber {
     ) -> Result<WhisperPipeline, TranscribeError> {
         let start = std::time::Instant::now();
 
-        Self::load_library(config)?;
+        let api = Self::load_library(config)?;
 
         let model_path_str = model_dir.to_str().ok_or_else(|| {
             TranscribeError::InitFailed("Model path contains invalid UTF-8".to_string())
@@ -220,9 +603,10 @@ impl OpenVinoTranscriber {
         let candidates = device_candidates(&config.device);
 
         let mut pipeline = None;
-        let mut first_error: Option<(String, openvino_genai::SetupError)> = None;
+        let mut first_error: Option<(String, TranscribeError)> = None;
         for (i, device) in candidates.iter().enumerate() {
-            match WhisperPipeline::with_properties(model_path_str, device, props) {
+            match WhisperPipeline::with_properties(Arc::clone(&api), model_path_str, device, props)
+            {
                 Ok(p) => {
                     if i > 0 {
                         tracing::warn!(
@@ -343,13 +727,11 @@ impl Transcriber for OpenVinoTranscriber {
         // A standalone WhisperGenerationConfig::new() uses generic defaults that may
         // not match the model; WhisperGenerationConfig::from_json() with the model's
         // generation_config.json is the alternative for standalone creation.
-        let mut gen_config = pipeline.get_generation_config().map_err(|e| {
-            TranscribeError::InferenceFailed(format!("Failed to get generation config: {}", e))
-        })?;
+        let mut gen_config = pipeline.generation_config()?;
 
         // Only set language/task on multilingual models (*.en models are English-only
         // and reject language/task overrides)
-        let is_multilingual = gen_config.get_is_multilingual().unwrap_or(false);
+        let is_multilingual = gen_config.is_multilingual().unwrap_or(false);
 
         if is_multilingual {
             // GenAI expects language tokens in "<|xx|>" format (matching lang_to_id keys
@@ -360,44 +742,27 @@ impl Transcriber for OpenVinoTranscriber {
             } else {
                 format!("<|{}|>", lang)
             };
-            gen_config.set_language(&lang_token).map_err(|e| {
-                TranscribeError::InferenceFailed(format!("Failed to set language: {}", e))
-            })?;
+            gen_config.set_language(&lang_token)?;
 
             let task = if self.config.translate {
                 "translate"
             } else {
                 "transcribe"
             };
-            gen_config.set_task(task).map_err(|e| {
-                TranscribeError::InferenceFailed(format!("Failed to set task: {}", e))
-            })?;
+            gen_config.set_task(task)?;
         } else if self.config.translate {
             tracing::warn!(
                 "Translation requested but model is not multilingual; ignoring translate setting"
             );
         }
 
-        gen_config.set_return_timestamps(false).map_err(|e| {
-            TranscribeError::InferenceFailed(format!("Failed to set return_timestamps: {}", e))
-        })?;
+        gen_config.set_return_timestamps(false)?;
 
-        let results = pipeline.generate(samples, Some(&gen_config)).map_err(|e| {
-            TranscribeError::InferenceFailed(format!("OpenVINO GenAI inference failed: {}", e))
-        })?;
+        let results = pipeline.generate(samples, &gen_config)?;
 
-        let text = results.get_string().map_err(|e| {
-            TranscribeError::InferenceFailed(format!("Failed to get transcription string: {}", e))
-        })?;
+        let text = results.text()?;
 
         let result = text.trim().to_string();
-
-        // Log performance metrics if available
-        if let Ok(metrics) = results.get_perf_metrics() {
-            if let Ok((gen_dur, _)) = metrics.get_generate_duration() {
-                tracing::debug!("GenAI generate duration: {:.0}ms", gen_dur);
-            }
-        }
 
         tracing::info!(
             "OpenVINO GenAI transcription completed in {:.2}s: {:?}",

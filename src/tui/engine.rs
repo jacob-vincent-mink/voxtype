@@ -446,7 +446,7 @@ impl EngineState {
         let inv = binary::inventory();
 
         // OpenVINO isn't part of the prebuilt binary distribution: no
-        // Whisper or ONNX variant links against openvino-genai (it's an
+        // Whisper or ONNX variant enables the OpenVINO GenAI loader (it's an
         // entirely separate Intel runtime, not an ONNX execution provider),
         // so there's no variant to switch to. It's purely a source-build
         // Cargo feature; just check whether the running binary has it.
