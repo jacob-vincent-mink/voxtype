@@ -5,6 +5,7 @@
 
 use crate::config::{CohereConfig, Config};
 use crate::error::TranscribeError;
+use crate::transcribe::cohere_chunking::CohereChunking;
 use crate::transcribe::Transcriber;
 use std::io::Read;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ pub struct CohereGgufTranscriber {
     backend: String,
     language: String,
     threads: Option<usize>,
+    chunking: CohereChunking,
 }
 
 impl CohereGgufTranscriber {
@@ -62,15 +64,11 @@ impl CohereGgufTranscriber {
             backend,
             language: config.language.clone(),
             threads: config.threads.filter(|&n| n > 0),
+            chunking: CohereChunking::new(config)?,
         })
     }
-}
 
-impl Transcriber for CohereGgufTranscriber {
-    fn transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
-        if samples.is_empty() {
-            return Ok(String::new());
-        }
+    fn transcribe_chunk(&self, samples: &[f32]) -> Result<String, TranscribeError> {
         let wav = tempfile::Builder::new()
             .prefix("voxtype_cohere_")
             .suffix(".wav")
@@ -134,6 +132,13 @@ impl Transcriber for CohereGgufTranscriber {
                     "Could not read transcribe-cli output: {e}"
                 ))
             })
+    }
+}
+
+impl Transcriber for CohereGgufTranscriber {
+    fn transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
+        self.chunking
+            .transcribe(samples, |chunk| self.transcribe_chunk(chunk))
     }
 }
 

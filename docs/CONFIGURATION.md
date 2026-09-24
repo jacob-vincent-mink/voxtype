@@ -1546,6 +1546,20 @@ language = "fr"
 
 The daemon resolves the language to its decoder prefix at startup. Unsupported codes are rejected with a clear error.
 
+### max_chunk_secs and boundary_search_secs
+
+**Defaults:** `35` seconds and `2.5` seconds, respectively.
+
+Cohere recordings longer than `max_chunk_secs` are divided into balanced segments before inference. Voxtype searches up to `boundary_search_secs` on either side of each target split for the quietest 100 ms of audio. Every sample is included once; adjacent segments do not overlap. This applies to both ONNX and GGUF Cohere models, including meeting audio passed to the engine. The model's official processor also chunks long recordings; keeping each inference at 35 seconds or less helps avoid long-form quality loss. Quiet-boundary splitting can still cut through speech when no silence is present.
+
+`max_chunk_secs` accepts 5–35; `boundary_search_secs` accepts 0–5. Set the search to `0` for exact balanced splits. Shorter chunks can improve long-form accuracy but increase processing time, especially with GGUF's current per-chunk CLI startup.
+
+```toml
+[cohere]
+max_chunk_secs = 30
+boundary_search_secs = 2.5
+```
+
 ### threads
 
 **Type:** Integer (optional)
@@ -1583,6 +1597,8 @@ on_demand_loading = true
 | `threads` | - | - | auto | ONNX intra-op thread count |
 | `gguf_backend` | - | - | `"auto"` | transcribe.cpp backend for GGUF models |
 | `gguf_cli_path` | - | - | `"transcribe-cli"` on PATH | Path to transcribe.cpp CLI |
+| `max_chunk_secs` | - | - | `35` | Maximum seconds per Cohere inference |
+| `boundary_search_secs` | - | - | `2.5` | Quiet-boundary search radius in seconds |
 | `on_demand_loading` | - | - | `false` | Load model only when recording starts |
 
 ### Complete Example

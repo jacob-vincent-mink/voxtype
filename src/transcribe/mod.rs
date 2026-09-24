@@ -76,6 +76,9 @@ pub mod cohere;
 #[cfg(feature = "cohere-gguf")]
 pub mod cohere_gguf;
 
+#[cfg(any(feature = "cohere", feature = "cohere-gguf"))]
+mod cohere_chunking;
+
 /// Cohere-specific log-mel feature extractor (NeMo conventions, 128 mels).
 #[cfg(feature = "cohere")]
 pub mod cohere_fbank;

@@ -25,6 +25,14 @@ pub struct CohereConfig {
     #[serde(default = "default_gguf_backend")]
     pub gguf_backend: String,
 
+    /// Maximum audio duration passed to Cohere in one inference, in seconds.
+    #[serde(default = "default_max_chunk_secs")]
+    pub max_chunk_secs: u32,
+
+    /// Search radius around a balanced split for the quietest boundary.
+    #[serde(default = "default_boundary_search_secs")]
+    pub boundary_search_secs: f32,
+
     /// Language for transcription. Two-letter ISO 639-1 codes
     /// (e.g. "en", "fr", "de"). Cohere supports 14 languages.
     #[serde(default = "default_cohere_language")]
@@ -47,12 +55,22 @@ fn default_gguf_backend() -> String {
     "auto".to_string()
 }
 
+fn default_max_chunk_secs() -> u32 {
+    35
+}
+
+fn default_boundary_search_secs() -> f32 {
+    2.5
+}
+
 impl Default for CohereConfig {
     fn default() -> Self {
         Self {
             model: "cohere-transcribe-q4f16".to_string(),
             gguf_cli_path: None,
             gguf_backend: default_gguf_backend(),
+            max_chunk_secs: default_max_chunk_secs(),
+            boundary_search_secs: default_boundary_search_secs(),
             language: default_cohere_language(),
             threads: None,
             on_demand_loading: false,

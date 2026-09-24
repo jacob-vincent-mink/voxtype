@@ -674,6 +674,26 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     )
     .for_onnx_engine("cohere"),
     spec(
+        "cohere.max_chunk_secs",
+        "cohere",
+        "max_chunk_secs",
+        KeyType::Int { min: 5, max: 35 },
+        "Engine",
+        "Max chunk duration",
+        "Maximum seconds per Cohere inference; longer recordings split near quiet boundaries.",
+    )
+    .for_onnx_engine("cohere"),
+    spec(
+        "cohere.boundary_search_secs",
+        "cohere",
+        "boundary_search_secs",
+        KeyType::Float { min: 0.0, max: 5.0 },
+        "Engine",
+        "Boundary search",
+        "Seconds around each balanced split to search for a quiet boundary.",
+    )
+    .for_onnx_engine("cohere"),
+    spec(
         "cohere.on_demand_loading",
         "cohere",
         "on_demand_loading",
@@ -1771,6 +1791,8 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         },
         "cohere.gguf_backend" => json!(co().gguf_backend),
         "cohere.gguf_cli_path" => json!(co().gguf_cli_path),
+        "cohere.max_chunk_secs" => json!(co().max_chunk_secs),
+        "cohere.boundary_search_secs" => json!(co().boundary_search_secs),
         "cohere.on_demand_loading" => json!(co().on_demand_loading),
 
         "openvino.model" => json!(ov().model),
