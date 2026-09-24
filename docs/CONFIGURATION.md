@@ -1498,9 +1498,11 @@ The Cohere model to use. ONNX models use a model name (looked up in `~/.local/sh
 | `cohere-transcribe-q4f16` | int4 weights, FP16 KV | ~1.5 GB | Recommended; smallest download, fastest CPU |
 | `cohere-transcribe-q4` | int4 weights, FP32 KV | ~2.0 GB | Same accuracy as q4f16, larger memory |
 | `cohere-transcribe-int8` | int8 | ~2.9 GB | Quality reference for quantized models |
-| `cohere-transcribe-fp16` | FP16 | ~3.9 GB | Highest accuracy, largest download |
+| `cohere-transcribe-fp16` | FP16 | ~3.9 GB | Highest accuracy, largest ONNX download |
+| `cohere-transcribe-03-2026-Q4_K_M.gguf` | Q4_K_M GGUF | 1.56 GB | transcribe.cpp, tested on Intel Vulkan |
+| `cohere-transcribe-03-2026-Q8_0.gguf` | Q8_0 GGUF | 2.41 GB | transcribe.cpp reference quantization |
 
-All variants are HuggingFace Optimum exports of Cohere Transcribe (16384 vocab, 14 languages). Download via `voxtype setup model` (interactive) — pick the Cohere section and confirm the size warning.
+The first four variants are HuggingFace Optimum ONNX exports. The GGUF variants are published for transcribe.cpp by handy-computer. Download either format via `voxtype setup model` (interactive), or pass its exact name to `voxtype setup --download --model <name>`. Setup verifies GGUF downloads against the publisher's SHA-256 before installing them.
 
 **Performance (warm CPU, voxtype 0.7.0, dictation-length audio):**
 
@@ -1627,18 +1629,24 @@ The prebuilt `voxtype-*-onnx-*` release binaries already include `cohere`, so us
 
 GGUF models use [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) in the Voxtype daemon through its Rust binding. The model and session remain loaded across recordings when `on_demand_loading = false`. This is the same `cohere` engine in Voxtype, with a different inference runtime selected by the `.gguf` extension. The ONNX model directory and GGUF file are distinct formats.
 
-Build Voxtype with `--features gpu-vulkan`, then configure:
+Build Voxtype with `--features gpu-vulkan`, then run `voxtype setup model` and choose a Cohere GGUF variant. To download without activating it:
+
+```sh
+voxtype setup --download --model cohere-transcribe-03-2026-Q4_K_M.gguf
+```
+
+To activate it explicitly, set:
 
 ```toml
 engine = "cohere"
 
 [cohere]
-model = "/absolute/path/cohere-transcribe-03-2026-Q4_K_M.gguf"
+model = "cohere-transcribe-03-2026-Q4_K_M.gguf"
 gguf_backend = "vulkan"
 language = "en"
 ```
 
-`gguf_backend = "vulkan"` requires a hardware Vulkan device and reports an error if none is selected; `"auto"` lets transcribe.cpp select the backend. `--features cohere-gguf` alone builds the CPU runtime; `--features cohere` also includes GGUF support. The Rust dependency builds transcribe.cpp from source and needs CMake and a C++ compiler; Vulkan builds also need Vulkan and SPIR-V headers plus `glslc`. Voxtype does not yet download GGUF variants through `voxtype setup model`; download the GGUF from the [transcribe.cpp Cohere model page](https://github.com/handy-computer/transcribe.cpp/blob/main/docs/models/cohere-transcribe-03-2026.md).
+`gguf_backend = "vulkan"` requires a hardware Vulkan device and reports an error if none is selected; `"auto"` lets transcribe.cpp select the backend. `--features cohere-gguf` alone builds the CPU runtime; `--features cohere` also includes GGUF support. The Rust dependency builds transcribe.cpp from source and needs CMake and a C++ compiler; Vulkan builds also need Vulkan and SPIR-V headers plus `glslc`. Setup downloads Q4_K_M and Q8_0 from a pinned revision of the [official transcribe.cpp Cohere GGUF repository](https://huggingface.co/handy-computer/cohere-transcribe-03-2026-gguf); the other published quantizations remain usable by absolute path.
 
 ---
 
