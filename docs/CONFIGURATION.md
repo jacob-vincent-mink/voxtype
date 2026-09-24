@@ -1486,10 +1486,10 @@ Cohere Transcribe is an encoder-decoder ASR model from Cohere Labs. It currently
 ### model
 
 **Type:** String
-**Default:** `"cohere-transcribe-int8"`
+**Default:** `"cohere-transcribe-q4f16"`
 **Required:** No
 
-The Cohere model to use. Can be a model name (looked up in `~/.local/share/voxtype/models/<name>/`) or an absolute path to a model directory.
+The Cohere model to use. ONNX models use a model name (looked up in `~/.local/share/voxtype/models/<name>/`) or a directory path. GGUF models use a `.gguf` file path, including `cohere-transcribe-03-2026-Q4_K_M.gguf`.
 
 **Available models:**
 
@@ -1581,6 +1581,8 @@ on_demand_loading = true
 | `model` | `--model` | `VOXTYPE_MODEL` | `"cohere-transcribe-q4f16"` | Cohere model name or path |
 | `language` | `--language` | `VOXTYPE_LANGUAGE` | `"en"` | One of the 14 supported language codes |
 | `threads` | - | - | auto | ONNX intra-op thread count |
+| `gguf_backend` | - | - | `"auto"` | transcribe.cpp backend for GGUF models |
+| `gguf_cli_path` | - | - | `"transcribe-cli"` on PATH | Path to transcribe.cpp CLI |
 | `on_demand_loading` | - | - | `false` | Load model only when recording starts |
 
 ### Complete Example
@@ -1605,6 +1607,26 @@ cargo build --release --features cohere-tensorrt  # NVIDIA + TensorRT EP
 ```
 
 The prebuilt `voxtype-*-onnx-*` release binaries already include `cohere`, so users installing via AUR/.deb/.rpm don't need to rebuild.
+
+### GGUF with Vulkan
+
+GGUF models use [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) through its `transcribe-cli`. This is the same `cohere` engine in voxtype, with a different inference runtime selected by the `.gguf` extension. The ONNX model directory and GGUF file are distinct formats.
+
+Build `transcribe-cli` with Vulkan enabled (`cmake -B build -DTRANSCRIBE_VULKAN=ON && cmake --build build --target transcribe-cli`), then configure:
+
+```toml
+engine = "cohere"
+
+[cohere]
+model = "/absolute/path/cohere-transcribe-03-2026-Q4_K_M.gguf"
+gguf_cli_path = "/absolute/path/transcribe.cpp/build/bin/transcribe-cli"
+gguf_backend = "vulkan"
+language = "en"
+```
+
+Build voxtype with `--features cohere-gguf` or `--features gpu-vulkan`; `--features cohere` also includes GGUF support. The external CLI must have Vulkan enabled independently. `gguf_backend = "vulkan"` requires Vulkan and reports an error if no Vulkan device is available; `"auto"` lets transcribe.cpp select the backend.
+
+The CLI reloads the model for every transcription, so short dictations can have substantial startup latency. A persistent in-process binding would be needed to remove that cost. Voxtype does not yet download GGUF variants through `voxtype setup model`; download the GGUF from the [transcribe.cpp Cohere model page](https://github.com/handy-computer/transcribe.cpp/blob/main/docs/models/cohere-transcribe-03-2026.md).
 
 ---
 

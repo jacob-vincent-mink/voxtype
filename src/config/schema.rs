@@ -184,7 +184,7 @@ pub fn feature_compiled(feature: &str) -> bool {
         "paraformer" => cfg!(feature = "paraformer"),
         "dolphin" => cfg!(feature = "dolphin"),
         "omnilingual" => cfg!(feature = "omnilingual"),
-        "cohere" => cfg!(feature = "cohere"),
+        "cohere" => cfg!(any(feature = "cohere", feature = "cohere-gguf")),
         "openvino" => cfg!(feature = "openvino-whisper"),
         _ => false,
     }
@@ -630,7 +630,7 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         KeyType::DynamicEnum { source: "models" },
         "Engine",
         "Model",
-        "Cohere Transcribe model variant (quantization level).",
+        "Cohere ONNX model variant or path to a transcribe.cpp GGUF file.",
     )
     .for_onnx_engine("cohere"),
     spec(
@@ -650,7 +650,27 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         KeyType::Int { min: 1, max: 256 },
         "Engine",
         "Threads",
-        "ONNX Runtime intra-op threads. Unset lets voxtype pick.",
+        "Inference threads. Unset lets the runtime pick.",
+    )
+    .for_onnx_engine("cohere"),
+    spec(
+        "cohere.gguf_backend",
+        "cohere",
+        "gguf_backend",
+        closed(&["auto", "cpu", "cpu_accel", "vulkan", "metal", "cuda", "rocm"]),
+        "Engine",
+        "GGUF backend",
+        "Compute backend for transcribe.cpp GGUF inference.",
+    )
+    .for_onnx_engine("cohere"),
+    spec(
+        "cohere.gguf_cli_path",
+        "cohere",
+        "gguf_cli_path",
+        KeyType::String,
+        "Engine",
+        "GGUF CLI path",
+        "Path to transcribe.cpp's transcribe-cli (defaults to PATH).",
     )
     .for_onnx_engine("cohere"),
     spec(
@@ -1749,6 +1769,8 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
             Some(n) => json!(n),
             None => Json::Null,
         },
+        "cohere.gguf_backend" => json!(co().gguf_backend),
+        "cohere.gguf_cli_path" => json!(co().gguf_cli_path),
         "cohere.on_demand_loading" => json!(co().on_demand_loading),
 
         "openvino.model" => json!(ov().model),

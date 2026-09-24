@@ -4,11 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use super::super::default_on_demand_loading;
 
-/// Cohere Transcribe speech-to-text configuration (ONNX-based, encoder-decoder).
-/// Requires: cargo build --features cohere
+/// Cohere Transcribe speech-to-text configuration (ONNX or GGUF).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CohereConfig {
-    /// Model name or directory containing the Cohere ONNX files.
+    /// Model name, ONNX directory, or path to a transcribe.cpp GGUF file.
     /// Expects HuggingFace Optimum layout:
     ///   encoder_model.onnx (+ .onnx_data),
     ///   decoder_model_merged.onnx (+ .onnx_data),
@@ -17,6 +16,14 @@ pub struct CohereConfig {
     ///              "cohere-transcribe-q4", "cohere-transcribe-int8",
     ///              "cohere-transcribe-fp16"
     pub model: String,
+
+    /// Path to transcribe.cpp's transcribe-cli for GGUF models. Defaults to PATH.
+    #[serde(default)]
+    pub gguf_cli_path: Option<String>,
+
+    /// transcribe.cpp compute backend for GGUF models (auto, cpu, vulkan, etc.).
+    #[serde(default = "default_gguf_backend")]
+    pub gguf_backend: String,
 
     /// Language for transcription. Two-letter ISO 639-1 codes
     /// (e.g. "en", "fr", "de"). Cohere supports 14 languages.
@@ -36,10 +43,16 @@ fn default_cohere_language() -> String {
     "en".to_string()
 }
 
+fn default_gguf_backend() -> String {
+    "auto".to_string()
+}
+
 impl Default for CohereConfig {
     fn default() -> Self {
         Self {
             model: "cohere-transcribe-q4f16".to_string(),
+            gguf_cli_path: None,
+            gguf_backend: default_gguf_backend(),
             language: default_cohere_language(),
             threads: None,
             on_demand_loading: false,
