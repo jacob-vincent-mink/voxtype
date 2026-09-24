@@ -17,10 +17,6 @@ pub struct CohereConfig {
     ///              "cohere-transcribe-fp16"
     pub model: String,
 
-    /// Path to transcribe.cpp's transcribe-cli for GGUF models. Defaults to PATH.
-    #[serde(default)]
-    pub gguf_cli_path: Option<String>,
-
     /// transcribe.cpp compute backend for GGUF models (auto, cpu, vulkan, etc.).
     #[serde(default = "default_gguf_backend")]
     pub gguf_backend: String,
@@ -67,7 +63,6 @@ impl Default for CohereConfig {
     fn default() -> Self {
         Self {
             model: "cohere-transcribe-q4f16".to_string(),
-            gguf_cli_path: None,
             gguf_backend: default_gguf_backend(),
             max_chunk_secs: default_max_chunk_secs(),
             boundary_search_secs: default_boundary_search_secs(),

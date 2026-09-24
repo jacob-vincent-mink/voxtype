@@ -1596,7 +1596,6 @@ on_demand_loading = true
 | `language` | `--language` | `VOXTYPE_LANGUAGE` | `"en"` | One of the 14 supported language codes |
 | `threads` | - | - | auto | ONNX intra-op thread count |
 | `gguf_backend` | - | - | `"auto"` | transcribe.cpp backend for GGUF models |
-| `gguf_cli_path` | - | - | `"transcribe-cli"` on PATH | Path to transcribe.cpp CLI |
 | `max_chunk_secs` | - | - | `35` | Maximum seconds per Cohere inference |
 | `boundary_search_secs` | - | - | `2.5` | Quiet-boundary search radius in seconds |
 | `on_demand_loading` | - | - | `false` | Load model only when recording starts |
@@ -1626,23 +1625,20 @@ The prebuilt `voxtype-*-onnx-*` release binaries already include `cohere`, so us
 
 ### GGUF with Vulkan
 
-GGUF models use [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) through its `transcribe-cli`. This is the same `cohere` engine in voxtype, with a different inference runtime selected by the `.gguf` extension. The ONNX model directory and GGUF file are distinct formats.
+GGUF models use [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) in the Voxtype daemon through its Rust binding. The model and session remain loaded across recordings when `on_demand_loading = false`. This is the same `cohere` engine in Voxtype, with a different inference runtime selected by the `.gguf` extension. The ONNX model directory and GGUF file are distinct formats.
 
-Build `transcribe-cli` with Vulkan enabled (`cmake -B build -DTRANSCRIBE_VULKAN=ON && cmake --build build --target transcribe-cli`), then configure:
+Build Voxtype with `--features gpu-vulkan`, then configure:
 
 ```toml
 engine = "cohere"
 
 [cohere]
 model = "/absolute/path/cohere-transcribe-03-2026-Q4_K_M.gguf"
-gguf_cli_path = "/absolute/path/transcribe.cpp/build/bin/transcribe-cli"
 gguf_backend = "vulkan"
 language = "en"
 ```
 
-Build voxtype with `--features cohere-gguf` or `--features gpu-vulkan`; `--features cohere` also includes GGUF support. The external CLI must have Vulkan enabled independently. `gguf_backend = "vulkan"` requires Vulkan and reports an error if no Vulkan device is available; `"auto"` lets transcribe.cpp select the backend.
-
-The CLI reloads the model for every transcription, so short dictations can have substantial startup latency. A persistent in-process binding would be needed to remove that cost. Voxtype does not yet download GGUF variants through `voxtype setup model`; download the GGUF from the [transcribe.cpp Cohere model page](https://github.com/handy-computer/transcribe.cpp/blob/main/docs/models/cohere-transcribe-03-2026.md).
+`gguf_backend = "vulkan"` requires a hardware Vulkan device and reports an error if none is selected; `"auto"` lets transcribe.cpp select the backend. `--features cohere-gguf` alone builds the CPU runtime; `--features cohere` also includes GGUF support. The Rust dependency builds transcribe.cpp from source and needs CMake and a C++ compiler; Vulkan builds also need Vulkan and SPIR-V headers plus `glslc`. Voxtype does not yet download GGUF variants through `voxtype setup model`; download the GGUF from the [transcribe.cpp Cohere model page](https://github.com/handy-computer/transcribe.cpp/blob/main/docs/models/cohere-transcribe-03-2026.md).
 
 ---
 

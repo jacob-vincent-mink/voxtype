@@ -1,7 +1,4 @@
-//! Cohere GGUF inference through transcribe.cpp's `transcribe-cli`.
-//!
-//! This stays separate from the ONNX implementation because GGUF is a
-//! transcribe.cpp model format, not an ONNX Runtime execution provider.
+//! Resident Cohere GGUF inference through transcribe.cpp's Rust binding.
 
 use crate::config::{CohereConfig, Config};
 use crate::error::TranscribeError;
@@ -9,164 +6,166 @@ use crate::transcribe::cohere_chunking::CohereChunking;
 use crate::transcribe::Transcriber;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::sync::Mutex;
+use transcribe_cpp::{Backend, Model, ModelOptions, RunOptions, Session, SessionOptions};
 
 pub struct CohereGgufTranscriber {
-    model: PathBuf,
-    cli: PathBuf,
-    backend: String,
+    session: Mutex<Session>,
     language: String,
-    threads: Option<usize>,
     chunking: CohereChunking,
 }
 
 impl CohereGgufTranscriber {
     pub fn new(config: &CohereConfig) -> Result<Self, TranscribeError> {
+        let chunking = CohereChunking::new(config)?;
         let configured = PathBuf::from(&config.model);
-        let model = if configured.exists() || configured.is_absolute() {
+        let model_path = if configured.exists() || configured.is_absolute() {
             configured
         } else {
             Config::models_dir().join(configured)
         };
-        let mut file = std::fs::File::open(&model)
-            .map_err(|e| TranscribeError::ModelNotFound(format!("{}: {e}", model.display())))?;
+        let mut file = std::fs::File::open(&model_path).map_err(|e| {
+            TranscribeError::ModelNotFound(format!("{}: {e}", model_path.display()))
+        })?;
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic).map_err(|e| {
             TranscribeError::InitFailed(format!(
                 "Cannot read GGUF header at {}: {e}",
-                model.display()
+                model_path.display()
             ))
         })?;
         if &magic != b"GGUF" {
             return Err(TranscribeError::InitFailed(format!(
                 "{} is not a GGUF model",
-                model.display()
+                model_path.display()
             )));
         }
-        let backend = config.gguf_backend.to_ascii_lowercase();
-        if !matches!(
-            backend.as_str(),
-            "auto" | "cpu" | "cpu_accel" | "vulkan" | "metal" | "cuda" | "rocm"
-        ) {
-            return Err(TranscribeError::ConfigError(format!(
-                "Invalid cohere.gguf_backend: {}",
-                config.gguf_backend
-            )));
-        }
-        let cli = config
-            .gguf_cli_path
-            .as_deref()
-            .unwrap_or("transcribe-cli")
-            .into();
-        Ok(Self {
-            model,
-            cli,
-            backend,
-            language: config.language.clone(),
-            threads: config.threads.filter(|&n| n > 0),
-            chunking: CohereChunking::new(config)?,
-        })
-    }
 
-    fn transcribe_chunk(&self, samples: &[f32]) -> Result<String, TranscribeError> {
-        let wav = tempfile::Builder::new()
-            .prefix("voxtype_cohere_")
-            .suffix(".wav")
-            .tempfile()
-            .map_err(|e| TranscribeError::AudioFormat(e.to_string()))?;
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut writer = hound::WavWriter::create(wav.path(), spec)
-            .map_err(|e| TranscribeError::AudioFormat(e.to_string()))?;
-        for &sample in samples {
-            writer
-                .write_sample((sample.clamp(-1.0, 1.0) * 32767.0) as i16)
-                .map_err(|e| TranscribeError::AudioFormat(e.to_string()))?;
+        let backend = parse_backend(&config.gguf_backend)?;
+        let model = Model::load_with(
+            &model_path,
+            &ModelOptions {
+                backend,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| TranscribeError::InitFailed(format!("GGUF model load: {e}")))?;
+        let device = model
+            .device()
+            .map_err(|e| TranscribeError::InitFailed(format!("GGUF device query: {e}")))?;
+        if backend == Backend::Vulkan {
+            let name = format!("{} {}", device.name, device.description).to_ascii_lowercase();
+            if device.kind != "vulkan"
+                || ["llvmpipe", "lavapipe", "swiftshader", "software"]
+                    .iter()
+                    .any(|renderer| name.contains(renderer))
+            {
+                return Err(TranscribeError::InitFailed(format!(
+                    "Cohere requested hardware Vulkan but transcribe.cpp selected {} [{}] ({})",
+                    device.name, device.kind, device.description
+                )));
+            }
         }
-        writer
-            .finalize()
-            .map_err(|e| TranscribeError::AudioFormat(e.to_string()))?;
-
-        let transcript = tempfile::Builder::new()
-            .prefix("voxtype_cohere_")
-            .suffix(".txt")
-            .tempfile()
-            .map_err(|e| TranscribeError::InferenceFailed(e.to_string()))?;
-        let mut command = Command::new(&self.cli);
-        command
-            .arg("--model")
-            .arg(&self.model)
-            .arg("--backend")
-            .arg(&self.backend)
-            .arg("--language")
-            .arg(&self.language)
-            .arg("--timestamps")
-            .arg("none")
-            .arg("--quiet")
-            .arg("--output")
-            .arg(transcript.path());
-        if let Some(threads) = self.threads {
-            command.arg("--threads").arg(threads.to_string());
-        }
-        let output = command.arg(wav.path()).output().map_err(|e| {
-            TranscribeError::InferenceFailed(format!(
-                "Could not start {}: {e}. Install transcribe.cpp with Vulkan support or set cohere.gguf_cli_path",
-                self.cli.display()
-            ))
-        })?;
-        if !output.status.success() {
-            return Err(TranscribeError::InferenceFailed(format!(
-                "transcribe-cli failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        std::fs::read_to_string(transcript.path())
-            .map(|s| s.trim().to_string())
-            .map_err(|e| {
-                TranscribeError::InferenceFailed(format!(
-                    "Could not read transcribe-cli output: {e}"
-                ))
+        tracing::info!(
+            "Cohere GGUF loaded on {} [{}] ({})",
+            device.name,
+            model.backend(),
+            device.description
+        );
+        let session = model
+            .session_with(&SessionOptions {
+                n_threads: config.threads.unwrap_or(0).try_into().map_err(|_| {
+                    TranscribeError::ConfigError("cohere.threads exceeds i32::MAX".into())
+                })?,
+                ..Default::default()
             })
+            .map_err(|e| TranscribeError::InitFailed(format!("GGUF session init: {e}")))?;
+        Ok(Self {
+            session: Mutex::new(session),
+            language: config.language.clone(),
+            chunking,
+        })
     }
 }
 
 impl Transcriber for CohereGgufTranscriber {
     fn transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
-        self.chunking
-            .transcribe(samples, |chunk| self.transcribe_chunk(chunk))
+        if samples.is_empty() {
+            return Ok(String::new());
+        }
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| TranscribeError::InferenceFailed(format!("GGUF session lock: {e}")))?;
+        let options = RunOptions {
+            language: Some(self.language.clone()),
+            ..Default::default()
+        };
+        self.chunking.transcribe(samples, |chunk| {
+            session
+                .run(chunk, &options)
+                .map(|result| result.text)
+                .map_err(|e| TranscribeError::InferenceFailed(format!("GGUF inference: {e}")))
+        })
     }
 }
 
-#[cfg(all(test, unix))]
+fn parse_backend(value: &str) -> Result<Backend, TranscribeError> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" => Ok(Backend::Auto),
+        "cpu" => Ok(Backend::Cpu),
+        "cpu_accel" => Ok(Backend::CpuAccel),
+        "vulkan" => Ok(Backend::Vulkan),
+        "metal" => Ok(Backend::Metal),
+        "cuda" => Ok(Backend::Cuda),
+        "rocm" => Ok(Backend::Rocm),
+        _ => Err(TranscribeError::ConfigError(format!(
+            "Invalid cohere.gguf_backend: {value}"
+        ))),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn gguf_routes_to_vulkan_cli_and_reads_transcript() {
+    fn validates_backend_and_model_header() {
+        assert_eq!(parse_backend("VULKAN").unwrap(), Backend::Vulkan);
+        assert!(parse_backend("bogus").is_err());
         let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().join("cohere-transcribe-03-2026-Q4_K_M.gguf");
-        std::fs::write(&model, b"GGUFtest").unwrap();
-        let cli = dir.path().join("transcribe-cli");
-        std::fs::write(&cli, b"#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --backend) [ \"$2\" = vulkan ] || exit 10; shift 2;;\n    --output) printf 'hello from GPU\\n' > \"$2\"; shift 2;;\n    *) shift;;\n  esac\ndone\n").unwrap();
-        let mut permissions = std::fs::metadata(&cli).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&cli, permissions).unwrap();
+        let invalid = dir.path().join("invalid.gguf");
+        std::fs::write(&invalid, b"not a gguf").unwrap();
         let config = CohereConfig {
-            model: model.to_string_lossy().into_owned(),
-            gguf_cli_path: Some(cli.to_string_lossy().into_owned()),
+            model: invalid.to_string_lossy().into_owned(),
+            ..CohereConfig::default()
+        };
+        assert!(CohereGgufTranscriber::new(&config).is_err());
+    }
+
+    /// Run with VOXTYPE_COHERE_GGUF_MODEL and VOXTYPE_COHERE_GGUF_WAV set.
+    #[test]
+    #[ignore = "requires a Cohere GGUF, speech WAV, and a Vulkan device"]
+    fn transcribes_twice_with_one_resident_vulkan_session() {
+        let config = CohereConfig {
+            model: std::env::var("VOXTYPE_COHERE_GGUF_MODEL").unwrap(),
             gguf_backend: "vulkan".into(),
             ..CohereConfig::default()
         };
+        let wav = std::env::var("VOXTYPE_COHERE_GGUF_WAV").unwrap();
+        let mut reader = hound::WavReader::open(wav).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.bits_per_sample, 16);
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|sample| sample.unwrap() as f32 / 32768.0)
+            .collect();
         let transcriber = CohereGgufTranscriber::new(&config).unwrap();
-        assert_eq!(
-            transcriber.transcribe(&[0.0; 160]).unwrap(),
-            "hello from GPU"
-        );
+        let first = transcriber.transcribe(&samples).unwrap();
+        let second = transcriber.transcribe(&samples).unwrap();
+        assert!(first.to_ascii_lowercase().contains("country"), "{first}");
+        assert_eq!(first, second);
     }
 }

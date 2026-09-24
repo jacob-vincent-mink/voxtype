@@ -664,16 +664,6 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     )
     .for_onnx_engine("cohere"),
     spec(
-        "cohere.gguf_cli_path",
-        "cohere",
-        "gguf_cli_path",
-        KeyType::String,
-        "Engine",
-        "GGUF CLI path",
-        "Path to transcribe.cpp's transcribe-cli (defaults to PATH).",
-    )
-    .for_onnx_engine("cohere"),
-    spec(
         "cohere.max_chunk_secs",
         "cohere",
         "max_chunk_secs",
@@ -1790,7 +1780,6 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
             None => Json::Null,
         },
         "cohere.gguf_backend" => json!(co().gguf_backend),
-        "cohere.gguf_cli_path" => json!(co().gguf_cli_path),
         "cohere.max_chunk_secs" => json!(co().max_chunk_secs),
         "cohere.boundary_search_secs" => json!(co().boundary_search_secs),
         "cohere.on_demand_loading" => json!(co().on_demand_loading),
